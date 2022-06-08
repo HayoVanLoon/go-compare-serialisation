@@ -1,0 +1,8 @@
+go 1.18
+
+use (
+	.
+	./out/protobuf/github.com/HayoVanLoon/genproto/research/serialisation/v1
+)
+
+replace github.com/HayoVanLoon/genproto/research/serialisation v0.0.0 => ./out/protobuf/github.com/HayoVanLoon/genproto/research/serialisation/v1
