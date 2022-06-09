@@ -5,7 +5,9 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	pb "github.com/HayoVanLoon/genproto/research/serialisation"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
@@ -14,6 +16,7 @@ import (
 	"math/rand"
 	"os"
 	"strings"
+	"unicode/utf8"
 )
 
 type Invoice struct {
@@ -90,41 +93,62 @@ func generateInvoice() *pb.Invoice {
 // number of bits for protobuf message size field
 const szBits = 4
 
-func generateFiles(lines int, fileJson, fileProto string) (err error) {
+const delim = "\n"
+
+func generateFiles(lines int, filePrefix, protoDelim string) (err error) {
 	closer := func(r io.ReadCloser) {
 		if e := r.Close(); err == nil && e != nil {
 			err = e
 		}
 	}
-	fjson, err := os.Create(fileJson)
-	if err != nil {
-		log.Fatal("could not open output file ", fileJson)
+	if protoDelim == "" {
+		protoDelim = delim
 	}
-	defer closer(fjson)
-	fproto, err := os.Create(fileProto)
+	fj, err := os.Create(filePrefix + fileExtJson)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
-	defer closer(fproto)
+	defer closer(fj)
+	fp, err := os.Create(filePrefix + fileExtProto)
+	if err != nil {
+		return err
+	}
+	defer closer(fp)
+	fps, err := os.Create(filePrefix + fileExtProtoString)
+	if err != nil {
+		return err
+	}
+	defer closer(fps)
 
 	sz := make([]byte, szBits)
 	for i := 0; i < lines; i += 1 {
 		inv := generateInvoice()
 
+		// json
 		bs, _ := protojson.Marshal(inv)
 		if err != nil {
 			return
 		}
-		if _, err = fjson.WriteString(string(bs) + "\n"); err != nil {
+		if _, err = fj.WriteString(string(bs) + delim); err != nil {
 			return
 		}
 
+		// proto bytes
 		bs, _ = proto.Marshal(inv)
 		encodeInt32(uint32(len(bs)), sz)
-		if _, err = fproto.Write(sz); err != nil {
+		if _, err = fp.Write(sz); err != nil {
 			return
 		}
-		if _, err = fproto.Write(bs); err != nil {
+		if _, err = fp.Write(bs); err != nil {
+			return
+		}
+
+		// proto string
+		b64 := base64.RawStdEncoding.EncodeToString(bs)
+		if err != nil {
+			return fmt.Errorf("error encoding to proto string: %s", err)
+		}
+		if _, err = fps.WriteString(b64 + protoDelim); err != nil {
 			return
 		}
 	}
@@ -145,7 +169,7 @@ func decodeInt32(p []byte) uint32 {
 	return u
 }
 
-func decodeJson(r io.Reader) (invs []*Invoice, err error) {
+func decodeJson(r io.Reader) (invs []Invoice, err error) {
 	dec := json.NewDecoder(r)
 	for dec.More() {
 		x := new(Invoice)
@@ -153,7 +177,7 @@ func decodeJson(r io.Reader) (invs []*Invoice, err error) {
 		if err != nil {
 			return
 		}
-		invs = append(invs, x)
+		invs = append(invs, *x)
 	}
 	return
 }
@@ -185,7 +209,76 @@ func decodeProto(r io.Reader) (invs []*pb.Invoice, err error) {
 	return invs, nil
 }
 
-func serialiseJson(invs []*Invoice) {
+func decodeProtoString(rd io.Reader, protoDelim string) (invs []*pb.Invoice, err error) {
+	if protoDelim == "" {
+		protoDelim = delim
+	}
+	p := make([]byte, 128)
+	rem := 0
+	idx := 0
+	b := &strings.Builder{}
+	for {
+		n, err := rd.Read(p[rem:])
+		if err != nil && err != io.EOF {
+			return nil, err
+		}
+		tot := n + rem
+		i := 0
+		for {
+			if i == tot {
+				rem = 0
+				break
+			}
+			r, size := utf8.DecodeRune(p[i:tot])
+			if r == utf8.RuneError {
+				if size == 1 {
+					rem = copy(p, p[i:tot])
+				}
+				if rem > utf8.UTFMax {
+					return nil, fmt.Errorf("could not convert utf8 at %d: %v", idx, p[:utf8.UTFMax])
+				}
+				break
+			}
+			if string(r) == protoDelim {
+				inv, err := unmarshalB64(b)
+				if err != nil {
+					return nil, err
+				}
+				invs = append(invs, inv)
+			} else {
+				b.WriteRune(r)
+			}
+			i += size
+			idx += size
+		}
+		if err == io.EOF {
+			break
+		}
+	}
+	if b.Len() > 0 {
+		inv, err := unmarshalB64(b)
+		if err != nil {
+			return nil, err
+		}
+		invs = append(invs, inv)
+	}
+	return invs, nil
+}
+
+func unmarshalB64(b *strings.Builder) (*pb.Invoice, error) {
+	bs, err := base64.RawStdEncoding.DecodeString(b.String())
+	if err != nil {
+		return nil, fmt.Errorf("error decoding b64 message: %s", err)
+	}
+	inv := new(pb.Invoice)
+	if err := proto.Unmarshal(bs, inv); err != nil {
+		return nil, err
+	}
+	b.Reset()
+	return inv, nil
+}
+
+func serialiseJson(invs []Invoice) {
 	for _, inv := range invs {
 		_, _ = json.Marshal(inv)
 	}
@@ -197,28 +290,17 @@ func serialiseProto(invs []*pb.Invoice) {
 	}
 }
 
-func manipulatePlain(invs []*Invoice) {
+func serialiseProtoString(invs []*pb.Invoice) {
 	for _, inv := range invs {
-		inv.Invoicee = inv.Invoicee[1:] + string(randAsciiLetter())
-		inv.Address.HouseNumber = -inv.Address.HouseNumber
-		inv.Address.Street = inv.Address.Street[1:] + string(randAsciiLetter())
-		inv.Address.PostalCode = inv.Address.PostalCode[1:] + string(randAsciiLetter())
-		inv.Address.Country = inv.Address.Country[1:] + string(randAsciiLetter())
-		var subtotal float32
-		for i := range inv.InvoiceLines {
-			inv.InvoiceLines[i].ProductName = inv.InvoiceLines[i].ProductName[1:] + string(randAsciiLetter())
-			inv.InvoiceLines[i].Price = -inv.InvoiceLines[i].Price
-			inv.InvoiceLines[i].Quantity = -inv.InvoiceLines[i].Quantity
-			subtotal += inv.InvoiceLines[i].Price * float32(inv.InvoiceLines[i].Quantity)
-		}
-		inv.Subtotal = subtotal
-		inv.TaxPct = -inv.TaxPct
-		inv.Total = subtotal * (1 + inv.TaxPct)
+		bs, _ := proto.Marshal(inv)
+		_ = base64.RawStdEncoding.EncodeToString(bs)
 	}
 }
 
-func manipulateProto(invs []*pb.Invoice) {
-	for _, inv := range invs {
+func manipulatePlain(invs []Invoice) []Invoice {
+	var updated []Invoice
+	for _, orig := range invs {
+		inv := orig
 		inv.Invoicee = inv.Invoicee[1:] + string(randAsciiLetter())
 		inv.Address.HouseNumber = -inv.Address.HouseNumber
 		inv.Address.Street = inv.Address.Street[1:] + string(randAsciiLetter())
@@ -234,20 +316,55 @@ func manipulateProto(invs []*pb.Invoice) {
 		inv.Subtotal = subtotal
 		inv.TaxPct = -inv.TaxPct
 		inv.Total = subtotal * (1 + inv.TaxPct)
+		updated = append(updated, inv)
 	}
+	return updated
+}
+
+func manipulateProto(invs []*pb.Invoice, immutable bool) []*pb.Invoice {
+	var updated []*pb.Invoice
+	for _, orig := range invs {
+		var inv *pb.Invoice
+		if immutable {
+			inv = new(pb.Invoice)
+			proto.Merge(inv, orig)
+		} else {
+			inv = orig
+		}
+		inv.Invoicee = inv.Invoicee[1:] + string(randAsciiLetter())
+		inv.Address.HouseNumber = -inv.Address.HouseNumber
+		inv.Address.Street = inv.Address.Street[1:] + string(randAsciiLetter())
+		inv.Address.PostalCode = inv.Address.PostalCode[1:] + string(randAsciiLetter())
+		inv.Address.Country = inv.Address.Country[1:] + string(randAsciiLetter())
+		var subtotal float32
+		for i := range inv.InvoiceLines {
+			inv.InvoiceLines[i].ProductName = inv.InvoiceLines[i].ProductName[1:] + string(randAsciiLetter())
+			inv.InvoiceLines[i].Price = -inv.InvoiceLines[i].Price
+			inv.InvoiceLines[i].Quantity = -inv.InvoiceLines[i].Quantity
+			subtotal += inv.InvoiceLines[i].Price * float32(inv.InvoiceLines[i].Quantity)
+		}
+		inv.Subtotal = subtotal
+		inv.TaxPct = -inv.TaxPct
+		inv.Total = subtotal * (1 + inv.TaxPct)
+		updated = append(updated, inv)
+	}
+	return updated
 }
 
 const (
-	fileJson  = "out/in.json"
-	fileProto = "out/in.pb"
+	filePrefix         = "out/in"
+	fileExtJson        = ".json"
+	fileExtProto       = ".pb"
+	fileExtProtoString = ".pb.txt"
 )
 
 func main() {
-	if err := generateFiles(10000, fileJson, fileProto); err != nil {
+	protoDelim := ""
+	if err := generateFiles(10000, filePrefix, protoDelim); err != nil {
 		log.Fatal(err)
 	}
 
-	f, err := os.Open(fileJson)
+	f, err := os.Open(filePrefix + fileExtJson)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -256,11 +373,20 @@ func main() {
 		log.Fatal(err)
 	}
 
-	f, err = os.Open(fileProto)
+	f, err = os.Open(filePrefix + fileExtProto)
 	if err != nil {
 		log.Fatal(err)
 	}
 	_, err = decodeProto(f)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	f, err = os.Open(filePrefix + fileExtProtoString)
+	if err != nil {
+		log.Fatal(err)
+	}
+	_, err = decodeProtoString(f, protoDelim)
 	if err != nil {
 		log.Fatal(err)
 	}
